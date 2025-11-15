@@ -1,5 +1,7 @@
 Spiral Animator (المحرك اللولبي) is an experimental 2D animation and drawing tool for desktop. It's designed for creating frame-by-frame animations with added features for generative art.
 
+![Screenshot of the Abo Kalleb Mixer interface](animator-screenshot.png.jpg)
+
 Features
 
 2D Animation: A full frame-by-frame animation timeline.
