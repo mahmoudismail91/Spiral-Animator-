@@ -1,11 +1,6 @@
-# Spiral-Animator-
-an experimental 2D animation and drawing tool for creating frame-by-frame animations a desktop , with added features for generative art. 
+Spiral Animator (المحرك اللولبي)
 
-It's designed for artists who want to draw and animate, with extra tools for embracing chaos like "throwing" random images onto the canvas or drawing with a "waver" (drunken) brush. It also has a simple audio player to help you animate to music.
-
-
-![[Screenshot of the Spiral Animator interface]([https://raw.githubusercontent.com/mahmoudismail91/Spiral-Animator-/refs/heads/main/animator-screenshot.png.jpg](https://raw.githubusercontent.com/mahmoudismail91/Spiral-Animator-/main/animator-screenshot.png.jpg)))
-
+Spiral Animator (المحرك اللولبي) is an experimental 2D animation and drawing tool for desktop, created by Mahmoud Ismail (Al Hut الحوت). It's designed for creating frame-by-frame animations with added features for generative art.
 
 Features
 
@@ -38,12 +33,11 @@ Linux (Ubuntu/Debian): sudo apt update && sudo apt install ffmpeg
 You can install all the required Python libraries using the requirements.txt file.
 
 # Clone this repository
-git clone [https://github.com/mahmoudismat81/Spiral-Animator.git](https://github.com/mahmoudismat81/Spiral-Animator.git)
+git clone [https://github.com/mahmoudismail91/Spiral-Animator.git](https://github.com/mahmoudismail91/Spiral-Animator.git)
 cd Spiral-Animator
 
 # Install the required libraries
 pip install -r requirements.txt
-
 
 
 Usage
@@ -51,7 +45,6 @@ Usage
 Once all dependencies are installed, you can run the application from your terminal:
 
 python animator25.py
-
 
 
 Use the Drawing Tools (Brush, Pencil, Fill, etc.) to draw on the canvas.
