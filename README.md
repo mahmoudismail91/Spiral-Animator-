@@ -1,9 +1,4 @@
-
 Spiral Animator (المحرك اللولبي) is an experimental 2D animation and drawing tool for desktop, created by Mahmoud Ismail (Al Hut الحوت). It's designed for creating frame-by-frame animations with added features for generative art.
-
-
-![Screenshot of the Spiral Animator interface](animator-screenshot.png.jpg)
-
 
 Features
 
@@ -33,7 +28,17 @@ Windows & Mac: Download from https://ffmpeg.org/download.html
 Linux (Ubuntu/Debian): sudo apt update && sudo apt install ffmpeg
 
 2. Python Dependencies:
-You can install all the required Python libraries using the requirements.txt file.
+This project requires the following Python libraries:
+
+PyQt6
+imageio
+numpy
+scipy
+pygame
+imageio-ffmpeg
+
+
+You can install all of them at once by cloning this repository and running:
 
 # Clone this repository
 git clone [https://github.com/mahmoudismail91/Spiral-Animator.git](https://github.com/mahmoudismail91/Spiral-Animator.git)
