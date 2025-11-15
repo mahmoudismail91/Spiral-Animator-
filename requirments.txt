@@ -1,0 +1,6 @@
+﻿PyQt6
+imageio
+numpy
+scipy
+pygame
+imageio-ffmpeg
