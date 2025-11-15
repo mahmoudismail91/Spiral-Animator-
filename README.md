@@ -1,4 +1,4 @@
-Spiral Animator (المحرك اللولبي) is an experimental 2D animation and drawing tool for desktop, created by Mahmoud Ismail (Al Hut الحوت). It's designed for creating frame-by-frame animations with added features for generative art.
+Spiral Animator (المحرك اللولبي) is an experimental 2D animation and drawing tool for desktop. It's designed for creating frame-by-frame animations with added features for generative art.
 
 Features
 
