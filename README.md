@@ -4,7 +4,7 @@ an experimental 2D animation and drawing tool for creating frame-by-frame animat
 It's designed for artists who want to draw and animate, with extra tools for embracing chaos like "throwing" random images onto the canvas or drawing with a "waver" (drunken) brush. It also has a simple audio player to help you animate to music.
 
 
-![[Screenshot of the Spiral Animator interface](animator-screenshot.png](https://raw.githubusercontent.com/mahmoudismail91/Spiral-Animator-/refs/heads/main/animator-screenshot.png.jpg))
+![[Screenshot of the Spiral Animator interface](animator-screenshot.png]([https://raw.githubusercontent.com/mahmoudismail91/Spiral-Animator-/refs/heads/main/animator-screenshot.png.jpg](https://raw.githubusercontent.com/mahmoudismail91/Spiral-Animator-/main/animator-screenshot.png.jpg)))
 
 
 Features
