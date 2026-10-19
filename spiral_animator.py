@@ -1,21 +1,24 @@
 # -----------------------------------------------------------------------------
 # 2D Animation and Drawing Application - Dynamic Canvas Resizing
 #
-# Version: 7.2.3 - Fixed Audio Stop/Continuous Live Recording
+# Version: 7.3.0 - Project Save/Open, Undo Across Frames, Fill Tolerance
 #
 # Installation:
-# pip install PyQt6 imageio numpy scipy
-# pip install pygame # <-- REQUIREMENT FOR AUDIO PLAYBACK
-# pip install imageio-ffmpeg
+# pip install -r requirements.txt
+# (PyQt6, imageio, numpy, scipy, pygame, imageio-ffmpeg)
+#
+# Usage:
+# python spiral_animator.py [project.spiral]
 # -----------------------------------------------------------------------------
 
 import sys
 import os
+import json
 import random
+import zipfile
 import imageio
 import numpy as np
-from collections import deque
-from scipy.ndimage import label # For fast flood fill
+from scipy.ndimage import label, binary_dilation # For fast flood fill
 
 import pygame
 
@@ -29,12 +32,25 @@ from PyQt6.QtGui import (
     QPixmap, QPainter, QPen, QColor, QAction, QIcon, QImage, QBrush,
     QUndoCommand, QUndoStack
 )
-from PyQt6.QtCore import Qt, QPoint, QPointF, QSize, QTimer, QRect, QPointF, QRectF
+from PyQt6.QtCore import Qt, QPoint, QPointF, QSize, QTimer, QRect, QRectF, QBuffer, QByteArray, QIODevice
 
 import subprocess
 import imageio_ffmpeg
 
 AUDIO_AVAILABLE = True  # Assuming pygame is installed
+AUDIO_EXTENSIONS = ('.wav', '.mp3', '.ogg', '.flac')
+
+APP_NAME = "Spiral Animator"
+APP_VERSION = "7.3.0"
+
+# --- Project files (.spiral) ---
+# A .spiral project is a zip archive holding:
+#   project.json            - canvas size, fps, frame count, ...
+#   frames/frame_0000.png   - one transparent PNG per frame
+PROJECT_EXTENSION = ".spiral"
+PROJECT_FILTER = f"Spiral Animator Project (*{PROJECT_EXTENSION})"
+PROJECT_FORMAT = "spiral-animator"
+PROJECT_FORMAT_VERSION = 1
 
 # --- Helper functions for NumPy conversion ---
 def qimage_to_numpy(image):
@@ -69,6 +85,15 @@ def numpy_to_qimage(arr):
     # when arr_contiguous goes out of scope.
     return image.copy()
 
+def pixmap_to_png_bytes(pixmap):
+    """Encodes a QPixmap as PNG and returns the raw bytes."""
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    pixmap.save(buffer, "PNG")
+    buffer.close()
+    return bytes(data)
+
 # -----------------------------------------------------------------------------
 # Undo Command (RESTORED)
 # -----------------------------------------------------------------------------
@@ -101,6 +126,58 @@ class DrawCommand(QUndoCommand):
         if self.frame_index == self.main_window.current_frame_index:
             self.main_window.refresh_scene_display()
         self.main_window.update_timeline_thumbnail(self.frame_index)
+
+# Frame add/delete and canvas resize are undo commands too, so the undo
+# history stays valid when frames shift around (it is no longer cleared
+# every time you switch frames).
+class InsertFrameCommand(QUndoCommand):
+    """Inserts a frame (blank or duplicated) at a given index."""
+    def __init__(self, main_window, index, pixmap, text="Add Frame", parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.index = index
+        self.pixmap = pixmap
+        self.setText(text)
+
+    def undo(self):
+        self.main_window.frames.pop(self.index)
+        self.main_window.go_to_frame(max(0, self.index - 1), rebuild_timeline=True)
+
+    def redo(self):
+        self.main_window.frames.insert(self.index, self.pixmap)
+        self.main_window.go_to_frame(self.index, rebuild_timeline=True)
+
+class DeleteFrameCommand(QUndoCommand):
+    """Removes the frame at a given index."""
+    def __init__(self, main_window, index, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.index = index
+        self.pixmap = main_window.frames[index]
+        self.setText("Delete Frame")
+
+    def undo(self):
+        self.main_window.frames.insert(self.index, self.pixmap)
+        self.main_window.go_to_frame(self.index, rebuild_timeline=True)
+
+    def redo(self):
+        self.main_window.frames.pop(self.index)
+        self.main_window.go_to_frame(min(self.index, len(self.main_window.frames) - 1), rebuild_timeline=True)
+
+class ResizeCanvasCommand(QUndoCommand):
+    """Swaps the canvas size and every frame between before/after the resize."""
+    def __init__(self, main_window, old_size, old_frames, new_size, new_frames, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.old_size, self.old_frames = QSize(old_size), list(old_frames)
+        self.new_size, self.new_frames = QSize(new_size), list(new_frames)
+        self.setText("Resize Canvas")
+
+    def undo(self):
+        self.main_window.apply_canvas(self.old_size, self.old_frames)
+
+    def redo(self):
+        self.main_window.apply_canvas(self.new_size, self.new_frames)
 
 # -----------------------------------------------------------------------------
 # Zoomable Graphics View - Handles panning, zooming, and resizing
@@ -284,6 +361,11 @@ class DrawingScene(QGraphicsScene):
             return self.current_pixmap_item.pixmap()
         return None
 
+    def _commit_pixmap(self, pixmap):
+        """Shows the painted pixmap and stores it as the current frame."""
+        self.current_pixmap_item.setPixmap(pixmap)
+        self.main_window.store_current_frame(pixmap)
+
     def mousePressEvent(self, event):
         # Prevent drawing if panning is active
         if self.main_window.is_panning:
@@ -375,7 +457,7 @@ class DrawingScene(QGraphicsScene):
             self._spray_paint(painter, point)
 
         painter.end()
-        self.current_pixmap_item.setPixmap(pixmap)
+        self._commit_pixmap(pixmap)
 
     def draw_line(self, start_point, end_point):
         """Draws a line based on the current tool."""
@@ -401,7 +483,7 @@ class DrawingScene(QGraphicsScene):
             self._spray_paint(painter, end_point)
 
         painter.end()
-        self.current_pixmap_item.setPixmap(pixmap)
+        self._commit_pixmap(pixmap)
     
     def _spray_paint(self, painter, center_point):
         """Simulates a spray paint effect."""
@@ -479,8 +561,10 @@ class DrawingScene(QGraphicsScene):
         # Convert target_rgba (int) to a (R, G, B, A) tuple
         target_rgba_tuple = (target_color.red(), target_color.green(), target_color.blue(), target_color.alpha())
 
-        # Create a 2D boolean mask where the color matches the target
-        mask = np.all(arr == target_rgba_tuple, axis=2)
+        # Create a 2D boolean mask where the color is within tolerance of the target
+        tolerance = int(self.settings.get('fill_tolerance', 0) * 255 / 100)
+        diff = np.abs(arr.astype(np.int16) - np.array(target_rgba_tuple, dtype=np.int16))
+        mask = diff.max(axis=2) <= tolerance
 
         # Use scipy.ndimage.label to find connected components
         labels, num_features = label(mask, structure=np.array([[0,1,0],[1,1,1],[0,1,0]]))
@@ -500,7 +584,19 @@ class DrawingScene(QGraphicsScene):
 
         # Apply the fill color to the masked area
         arr[fill_mask] = fill_rgba_tuple
-        
+
+        # Paint the fill *underneath* the 1px border around the region, so the
+        # soft (antialiased) edges of lines don't leave a halo of unfilled pixels.
+        ring = binary_dilation(fill_mask) & ~fill_mask
+        if ring.any():
+            src = arr[ring].astype(np.float32) / 255.0
+            fill = np.array(fill_rgba_tuple, dtype=np.float32) / 255.0
+            src_a = src[:, 3:4]
+            fill_a = fill[3] * (1.0 - src_a)
+            out_a = src_a + fill_a
+            out_rgb = (src[:, :3] * src_a + fill[:3] * fill_a) / np.maximum(out_a, 1e-6)
+            arr[ring] = np.round(np.concatenate([out_rgb, out_a], axis=1) * 255).astype(np.uint8)
+
         # Convert back to QImage/QPixmap
         filled_image = numpy_to_qimage(arr)
         pixmap_after = QPixmap.fromImage(filled_image)
@@ -512,11 +608,8 @@ class DrawingScene(QGraphicsScene):
             self.pixmap_before_draw, 
             pixmap_after
         )
+        # Pushing runs redo(), which stores and shows the filled frame
         self.main_window.undo_stack.push(command)
-        
-        # Update the scene
-        self.current_pixmap_item.setPixmap(pixmap_after)
-        self.main_window.update_timeline_thumbnail(self.main_window.current_frame_index)
         
 # -----------------------------------------------------------------------------
 # Main Application Window
@@ -524,7 +617,6 @@ class DrawingScene(QGraphicsScene):
 class AnimatorApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("2D Animation Studio (v7.2.3)")
         self.setGeometry(100, 100, 1200, 800)
 
         if AUDIO_AVAILABLE:
@@ -540,7 +632,8 @@ class AnimatorApp(QMainWindow):
             'color': QColor('black'),
             'size': 15,
             'opacity': 100,
-            'drunkenness': 0
+            'drunkenness': 0,
+            'fill_tolerance': 20
         }
 
         # --- Animation Playback ---
@@ -572,9 +665,17 @@ class AnimatorApp(QMainWindow):
         self.is_recording = False
         self.recording_writer = None
         self.recording_path = None
+        self.recording_audio_track = None
+        self.recording_audio_offset = 0.0
+
+        # --- Project File State ---
+        self.project_path = None
+        self.has_unsaved_changes = False
         
         self.init_ui()
-        self.add_new_frame()
+        self.reset_frames()
+        # Any undo/redo step changes the drawing
+        self.undo_stack.indexChanged.connect(self.on_history_changed)
 
     def init_ui(self):
         # --- Central Canvas ---
@@ -710,7 +811,21 @@ class AnimatorApp(QMainWindow):
         self.drunken_display = QLabel(f"Waver: {self.settings['drunkenness']}")
         self.drunken_slider.valueChanged.connect(lambda v: self.drunken_display.setText(f"Waver: {v}"))
         layout.addWidget(self.drunken_display)
-        
+
+        # Fill Tolerance Slider
+        tolerance_label = QLabel("Fill Tolerance")
+        layout.addWidget(tolerance_label)
+        self.tolerance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tolerance_slider.setRange(0, 100)
+        self.tolerance_slider.setValue(self.settings['fill_tolerance'])
+        self.tolerance_slider.setToolTip("How different a color can be and still get filled")
+        self.tolerance_slider.valueChanged.connect(lambda v: self.update_setting('fill_tolerance', v))
+        layout.addWidget(self.tolerance_slider)
+
+        self.tolerance_display = QLabel(f"Tolerance: {self.settings['fill_tolerance']}%")
+        self.tolerance_slider.valueChanged.connect(lambda v: self.tolerance_display.setText(f"Tolerance: {v}%"))
+        layout.addWidget(self.tolerance_display)
+
         dock.setWidget(settings_widget)
     
     def update_color_button(self):
@@ -782,7 +897,24 @@ class AnimatorApp(QMainWindow):
         new_action.setShortcut("Ctrl+N")
         new_action.triggered.connect(self.new_animation)
         file_menu.addAction(new_action)
-        
+
+        open_action = QAction("Open Project...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self.open_project)
+        file_menu.addAction(open_action)
+
+        save_action = QAction("Save Project", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_project)
+        file_menu.addAction(save_action)
+
+        save_as_action = QAction("Save Project As...", self)
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.triggered.connect(self.save_project_as)
+        file_menu.addAction(save_as_action)
+
+        file_menu.addSeparator()
+
         import_action = QAction("Import Image...", self)
         import_action.setShortcut("Ctrl+I")
         import_action.triggered.connect(self.import_image)
@@ -868,7 +1000,7 @@ class AnimatorApp(QMainWindow):
 
     def create_assets_dock(self):
         """Creates the dock for random image assets and audio controls."""
-        dock = QDockWidget("Random Assets & Audio", self)
+        dock = QDockWidget("Random Assets && Audio", self)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         
         assets_widget = QWidget()
@@ -952,20 +1084,34 @@ class AnimatorApp(QMainWindow):
             QMessageBox.warning(self, "Recording Active", "Please stop recording before creating a new animation.")
             return
 
-        reply = QMessageBox.question(self, "New Animation", 
-                                   "This will clear all frames. Continue?",
-                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.frames.clear()
-            self.current_frame_index = -1
-            self.canvas_size = QSize(800, 600) # Reset to default size
-            self.undo_stack.clear()
-            self.clear_timeline()
-            self.add_new_frame()
-            self.scene.setup_paper()
-            self.update_status()
-            self.reset_view()
-            self.stop_audio() # Stop audio on new animation
+        if not self.maybe_save_changes():
+            return
+
+        self.canvas_size = QSize(800, 600) # Reset to default size
+        self.scene.setup_paper()
+        self.reset_frames()
+        self.reset_view()
+        self.stop_audio() # Stop audio on new animation
+
+    def blank_frame(self):
+        """Returns a new transparent frame at the current canvas size."""
+        pixmap = QPixmap(self.canvas_size)
+        pixmap.fill(Qt.GlobalColor.transparent) # Transparent background
+        return pixmap
+
+    def reset_frames(self, frames=None, current_index=0):
+        """Replaces the whole animation (new / open) and starts a fresh history."""
+        self.frames = list(frames) if frames else [self.blank_frame()]
+        self.current_frame_index = -1
+        self.undo_stack.clear()
+        self.go_to_frame(min(max(current_index, 0), len(self.frames) - 1), rebuild_timeline=True)
+        self.set_unsaved_changes(False)
+
+    def store_current_frame(self, pixmap):
+        """Called by the scene after every stroke so self.frames is always current."""
+        if 0 <= self.current_frame_index < len(self.frames):
+            self.frames[self.current_frame_index] = pixmap
+            self.mark_dirty()
 
     def clear_timeline(self):
         """Clear all frame widgets from timeline."""
@@ -976,68 +1122,42 @@ class AnimatorApp(QMainWindow):
 
     def add_new_frame(self):
         """Add a new blank frame after the current frame."""
-        # Save current frame first
-        if self.current_frame_index >= 0:
-            current_pixmap = self.scene.get_current_pixmap()
-            if current_pixmap:
-                self.frames[self.current_frame_index] = current_pixmap.copy()
-        
-        pixmap = QPixmap(self.canvas_size)
-        pixmap.fill(Qt.GlobalColor.transparent) # Transparent background
-        self.frames.insert(self.current_frame_index + 1, pixmap)
-        self.set_current_frame(self.current_frame_index + 1)
-        self.update_timeline()
+        self.undo_stack.push(InsertFrameCommand(self, self.current_frame_index + 1, self.blank_frame()))
 
     def duplicate_current_frame(self):
         """Duplicate the current frame."""
         if self.current_frame_index >= 0:
-            # Save current frame first
-            current_pixmap = self.scene.get_current_pixmap()
-            if current_pixmap:
-                self.frames[self.current_frame_index] = current_pixmap.copy()
-            
-            # Duplicate it
             duplicated = self.frames[self.current_frame_index].copy()
-            self.frames.insert(self.current_frame_index + 1, duplicated)
-            self.set_current_frame(self.current_frame_index + 1)
-            self.update_timeline()
+            self.undo_stack.push(
+                InsertFrameCommand(self, self.current_frame_index + 1, duplicated, "Duplicate Frame")
+            )
 
     def delete_current_frame(self):
         if self.is_recording: return
 
         if len(self.frames) > 1 and self.current_frame_index >= 0:
-            self.frames.pop(self.current_frame_index)
-            self.undo_stack.clear() # History is gone for this frame
-            new_index = min(self.current_frame_index, len(self.frames) - 1)
-            self.current_frame_index = new_index
-            self.refresh_scene_display()
-            self.update_status()
-            self.update_timeline()
+            self.undo_stack.push(DeleteFrameCommand(self, self.current_frame_index))
         elif len(self.frames) == 1:
             QMessageBox.warning(self, "Cannot Delete", "Cannot delete the last frame.")
 
     def set_current_frame(self, index):
-        """
-        Change the currently active frame. This clears the undo stack.
-        """
-        if 0 <= index < len(self.frames):
-            if self.current_frame_index == index:
-                return # Already on this frame
-                
-            # Save the current drawing back to its pixmap before switching
-            if self.current_frame_index >= 0 and self.current_frame_index < len(self.frames):
-                current_pixmap = self.scene.get_current_pixmap()
-                if current_pixmap:
-                    self.frames[self.current_frame_index] = current_pixmap.copy()
-
-            self.current_frame_index = index
-            self.refresh_scene_display()
-            self.update_status()
+        """Change the currently active frame (e.g. from a timeline click)."""
+        if 0 <= index < len(self.frames) and index != self.current_frame_index:
+            self.go_to_frame(index)
+        else:
+            # Clicking the active frame would otherwise uncheck its button
             self.update_timeline_selection()
-            
-            # Clear undo stack, as it's for a different frame
-            self.undo_stack.clear()
-    
+
+    def go_to_frame(self, index, rebuild_timeline=False):
+        """Shows a frame. Frames always hold the latest drawing, so nothing needs saving first."""
+        self.current_frame_index = index
+        self.refresh_scene_display()
+        if rebuild_timeline:
+            self.update_timeline()
+        else:
+            self.update_timeline_selection()
+        self.update_status()
+
     def refresh_scene_display(self):
         """
         Reloads the current frame into the scene, redrawing onion skin.
@@ -1174,11 +1294,6 @@ class AnimatorApp(QMainWindow):
             self.is_playing = False
             self.play_action.setText("▶️ Play")
         else:
-            if self.current_frame_index >= 0:
-                current_pixmap = self.scene.get_current_pixmap()
-                if current_pixmap:
-                    self.frames[self.current_frame_index] = current_pixmap.copy()
-            
             self.is_playing = True
             self.play_action.setText("⏸️ Pause")
             self.update_playback_speed()
@@ -1191,22 +1306,9 @@ class AnimatorApp(QMainWindow):
 
     def next_frame(self):
         if len(self.frames) > 0:
-            
-            # Save the current drawing back to its pixmap before switching
-            # This is what enables "live drawing" during playback.
-            if self.current_frame_index >= 0 and self.current_frame_index < len(self.frames):
-                current_pixmap = self.scene.get_current_pixmap()
-                if current_pixmap:
-                    self.frames[self.current_frame_index] = current_pixmap.copy()
-            
-            # We are just *displaying* frames, not *editing* them.
-            # So we use a lightweight frame change that doesn't clear undo.
-            next_idx = (self.current_frame_index + 1) % len(self.frames)
-            
-            self.current_frame_index = next_idx
-            self.refresh_scene_display()
-            self.update_status()
-            self.update_timeline_selection()
+            # Strokes are stored into self.frames as they are drawn, which is
+            # what enables "live drawing" during playback.
+            self.go_to_frame((self.current_frame_index + 1) % len(self.frames))
 
             if self.is_recording and self.recording_writer:
                 # Get the current frame and draw it on a white background
@@ -1324,16 +1426,18 @@ class AnimatorApp(QMainWindow):
             
             resized_frames.append(new_pixmap)
 
-        # 3. Update Application State
-        self.canvas_size = new_size
-        self.frames = resized_frames
-        
-        # 4. Refresh UI
-        self.scene.setup_paper() # Update paper size
-        self.refresh_scene_display() # Redraw current frame
-        self.update_timeline() # Update thumbnails
-        self.update_status()
+        # 3. Apply as an undoable step
+        self.undo_stack.push(
+            ResizeCanvasCommand(self, self.canvas_size, self.frames, new_size, resized_frames)
+        )
         self.reset_view() # Zoom out to see the new canvas boundaries
+
+    def apply_canvas(self, size, frames):
+        """Sets the canvas size and all frames at once (used by resize undo/redo)."""
+        self.canvas_size = QSize(size)
+        self.frames = list(frames)
+        self.scene.setup_paper() # Update paper size
+        self.go_to_frame(min(self.current_frame_index, len(self.frames) - 1), rebuild_timeline=True)
 
     # --- Image Import ---
     def paste_image_on_current_frame(self, image_path):
@@ -1459,8 +1563,7 @@ class AnimatorApp(QMainWindow):
             self.stop_audio()
             self.audio_folder_path = dir_path
             self.audio_file_list = []
-            # Focusing on WAV for reliable playback via pygame
-            valid_extensions = ('.wav',) 
+            valid_extensions = AUDIO_EXTENSIONS
             
             try:
                 # Scan recursively
@@ -1475,13 +1578,13 @@ class AnimatorApp(QMainWindow):
             if self.audio_file_list:
                 self.next_audio_btn.setEnabled(True)
                 self.pause_audio_btn.setEnabled(False)
-                self.audio_folder_label.setText(f"{len(self.audio_file_list)} WAV tracks found.")
+                self.audio_folder_label.setText(f"{len(self.audio_file_list)} audio tracks found.")
                 self.current_audio_index = -1 # Start before the first track
                 self.next_audio_track() # Load and play the first track
             else:
                 self.next_audio_btn.setEnabled(False)
                 self.pause_audio_btn.setEnabled(False)
-                self.audio_folder_label.setText("No valid WAV audio files found.")
+                self.audio_folder_label.setText("No audio files found (wav, mp3, ogg, flac).")
 
     def next_audio_track(self):
         """Loads and plays the next random audio track."""
@@ -1491,8 +1594,9 @@ class AnimatorApp(QMainWindow):
             
         self.stop_audio()
 
-        # Simple sequential/looping selection
-        self.current_audio_index = (self.current_audio_index + 1) % len(self.audio_file_list)
+        # Random selection, avoiding an immediate repeat when there is a choice
+        choices = [i for i in range(len(self.audio_file_list)) if i != self.current_audio_index]
+        self.current_audio_index = random.choice(choices or [0])
         self.current_audio_track = self.audio_file_list[self.current_audio_index]
         
         # Display the loaded track name
@@ -1508,8 +1612,139 @@ class AnimatorApp(QMainWindow):
             self.is_audio_paused = False
             self.pause_audio_btn.setText("Pause Audio")
         except Exception as e:
-            QMessageBox.critical(self, "Playback Error", f"Could not play audio track:\n{e}\n(Ensure it is a valid WAV file)")
+            QMessageBox.critical(self, "Playback Error", f"Could not play audio track:\n{e}\n(Ensure it is a valid wav, mp3, ogg or flac file)")
         
+    # --- Project Files (.spiral) ---
+    def on_history_changed(self, _index):
+        self.mark_dirty()
+
+    def mark_dirty(self):
+        if not self.has_unsaved_changes:
+            self.set_unsaved_changes(True)
+
+    def set_unsaved_changes(self, dirty):
+        self.has_unsaved_changes = dirty
+        self.update_window_title()
+
+    def update_window_title(self):
+        name = os.path.basename(self.project_path) if self.project_path else "Untitled"
+        star = "*" if self.has_unsaved_changes else ""
+        self.setWindowTitle(f"{name}{star} — {APP_NAME} (v{APP_VERSION})")
+
+    def maybe_save_changes(self):
+        """Asks to save unsaved work. Returns False if the user cancelled."""
+        if not self.has_unsaved_changes:
+            return True
+        reply = QMessageBox.question(
+            self, "Unsaved Changes",
+            "Save changes to your animation first?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            return self.save_project()
+        return reply == QMessageBox.StandardButton.Discard
+
+    def save_project(self):
+        """Saves to the current project file, asking for a path the first time."""
+        if not self.project_path:
+            return self.save_project_as()
+        return self.write_project_file(self.project_path)
+
+    def save_project_as(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Project", self.project_path or "", PROJECT_FILTER)
+        if not path:
+            return False
+        if not path.lower().endswith(PROJECT_EXTENSION):
+            path += PROJECT_EXTENSION
+        return self.write_project_file(path)
+
+    def write_project_file(self, path):
+        """Writes all frames and settings to a .spiral file. Returns True on success."""
+        meta = {
+            "format": PROJECT_FORMAT,
+            "format_version": PROJECT_FORMAT_VERSION,
+            "app_version": APP_VERSION,
+            "canvas_width": self.canvas_size.width(),
+            "canvas_height": self.canvas_size.height(),
+            "fps": self.speed_slider.value(),
+            "onion_skin": self.onion_skin_enabled,
+            "current_frame": self.current_frame_index,
+            "frame_count": len(self.frames),
+        }
+        # Write to a temp file first so a failed save never destroys the old project
+        temp_path = path + ".saving"
+        try:
+            with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("project.json", json.dumps(meta, indent=2))
+                for i, frame in enumerate(self.frames):
+                    # PNGs are already compressed, so store them as-is
+                    zf.writestr(f"frames/frame_{i:04d}.png", pixmap_to_png_bytes(frame),
+                                compress_type=zipfile.ZIP_STORED)
+            os.replace(temp_path, path)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            QMessageBox.critical(self, "Save Error", f"Could not save project:\n{e}")
+            return False
+
+        self.project_path = path
+        self.set_unsaved_changes(False)
+        self.statusBar().showMessage(f"Saved {os.path.basename(path)}", 5000)
+        return True
+
+    def open_project(self):
+        if self.is_recording:
+            QMessageBox.warning(self, "Recording Active", "Please stop recording before opening a project.")
+            return
+        if not self.maybe_save_changes():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", PROJECT_FILTER)
+        if path:
+            self.load_project_file(path)
+
+    def load_project_file(self, path):
+        """Loads a .spiral file, replacing the current animation. Returns True on success."""
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                meta = json.loads(zf.read("project.json"))
+                if meta.get("format") != PROJECT_FORMAT:
+                    raise ValueError("This is not a Spiral Animator project.")
+                if meta.get("format_version", 1) > PROJECT_FORMAT_VERSION:
+                    raise ValueError("This project was saved by a newer version of Spiral Animator.")
+
+                canvas_size = QSize(int(meta["canvas_width"]), int(meta["canvas_height"]))
+                frames = []
+                for i in range(int(meta["frame_count"])):
+                    pixmap = QPixmap()
+                    if not pixmap.loadFromData(zf.read(f"frames/frame_{i:04d}.png"), "PNG"):
+                        raise ValueError(f"Frame {i + 1} is damaged.")
+                    if pixmap.size() != canvas_size:
+                        # Place it on a canvas-sized frame so every frame matches
+                        fitted = QPixmap(canvas_size)
+                        fitted.fill(Qt.GlobalColor.transparent)
+                        painter = QPainter(fitted)
+                        painter.drawPixmap(0, 0, pixmap)
+                        painter.end()
+                        pixmap = fitted
+                    frames.append(pixmap)
+        except Exception as e:
+            QMessageBox.critical(self, "Open Error", f"Could not open project:\n{e}")
+            return False
+
+        if self.is_playing:
+            self.toggle_playback()
+
+        self.canvas_size = canvas_size
+        self.scene.setup_paper()
+        self.speed_slider.setValue(int(meta.get("fps", self.speed_slider.value())))
+        self.onion_skin_action.setChecked(bool(meta.get("onion_skin", False)))
+        self.project_path = path
+        self.reset_frames(frames, int(meta.get("current_frame", 0)))
+        self.reset_view()
+        self.statusBar().showMessage(f"Opened {os.path.basename(path)}", 5000)
+        return True
+
     # --- Exporting and Recording ---
     def export_video_file(self, format_type):
         """Exports all frames as a clean video file (offline - records timeline once)."""
@@ -1556,7 +1791,7 @@ class AnimatorApp(QMainWindow):
                 output_frames.append(bg_pixmap)
             
             # Use imageio to write frames (video only)
-            self.recording_writer = imageio.get_writer(self.recording_path, fps=fps, macro_block_size=1)
+            self.recording_writer = self.open_video_writer(self.recording_path, fps)
             
             for pixmap in output_frames:
                 image = pixmap.toImage()
@@ -1568,7 +1803,7 @@ class AnimatorApp(QMainWindow):
             
             # If MP4 and audio is loaded, merge audio using ffmpeg
             if self.current_audio_track and format_type == 'mp4':
-                self.merge_audio_to_mp4(path)
+                self.merge_audio_to_mp4(path, self.current_audio_track)
             
             QMessageBox.information(self, "Success", f"Animation successfully saved to {os.path.basename(self.recording_path)}")
 
@@ -1578,19 +1813,24 @@ class AnimatorApp(QMainWindow):
                 self.recording_writer = None
             QMessageBox.critical(self, "Recording Error", f"Could not save recording:\n{e}")
 
-    def merge_audio_to_mp4(self, video_path):
-        """Merges the current audio track into the MP4 video using ffmpeg."""
+    def merge_audio_to_mp4(self, video_path, audio_path, audio_offset=0.0):
+        """
+        Merges an audio track into the MP4 video using ffmpeg.
+        audio_offset (seconds) skips the start of the track, so a live recording
+        lines up with the music that was actually playing while it was made.
+        """
+        temp_path = video_path + '.temp.mp4'
         try:
             ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-            temp_path = video_path + '.temp.mp4'
-            os.rename(video_path, temp_path)
+            os.replace(video_path, temp_path)
             
             # Run ffmpeg to merge: copy video stream, encode audio to AAC
             # -shortest: trim to the shorter duration (video or audio)
             result = subprocess.run([
-                ffmpeg_path,
+                ffmpeg_path, '-y',
                 '-i', temp_path,               # Input video (no audio)
-                '-i', self.current_audio_track, # Input audio (WAV)
+                '-ss', f"{audio_offset:.3f}",  # Start the audio where playback was
+                '-i', audio_path,              # Input audio
                 '-c:v', 'copy',                # Copy video stream (no re-encode)
                 '-c:a', 'aac',                 # Encode audio to AAC (MP4 compatible)
                 '-strict', 'experimental',     # Allow AAC
@@ -1608,7 +1848,13 @@ class AnimatorApp(QMainWindow):
             QMessageBox.warning(self, "Audio Merge Warning", f"Could not merge audio:\n{e}\nThe video was saved without audio.")
             # Restore original video if merge failed
             if os.path.exists(temp_path):
-                os.rename(temp_path, video_path)
+                os.replace(temp_path, video_path)
+
+    def open_video_writer(self, path, fps):
+        """Opens an imageio writer; GIFs are set to loop forever."""
+        if path.lower().endswith('.gif'):
+            return imageio.get_writer(path, fps=fps, loop=0)
+        return imageio.get_writer(path, fps=fps, macro_block_size=1)
 
     def start_live_recording(self, format_type):
         """Starts the live recording (captures playback loop until stopped)."""
@@ -1623,10 +1869,17 @@ class AnimatorApp(QMainWindow):
             return
 
         try:
-            # FIX: REMOVED self.stop_audio() here so music plays during recording
+            # Music keeps playing during recording. Remember which track and how far
+            # into it we are, so the MP4's audio matches what you heard.
+            self.recording_audio_track = None
+            self.recording_audio_offset = 0.0
+            if AUDIO_AVAILABLE and self.current_audio_track and pygame.mixer.music.get_busy():
+                self.recording_audio_track = self.current_audio_track
+                self.recording_audio_offset = max(0, pygame.mixer.music.get_pos()) / 1000.0
+
             self.recording_path = path
             fps = self.speed_slider.value()
-            self.recording_writer = imageio.get_writer(self.recording_path, fps=fps, macro_block_size=1)
+            self.recording_writer = self.open_video_writer(self.recording_path, fps)
             
             self.is_recording = True
             self.update_status()
@@ -1660,10 +1913,10 @@ class AnimatorApp(QMainWindow):
         
         saved_path = self.recording_path
         
-        # If MP4 and audio is loaded, merge audio using ffmpeg
+        # If MP4 and music was playing when recording started, merge it using ffmpeg
         ext = os.path.splitext(saved_path)[1].lower()
-        if self.current_audio_track and ext == '.mp4':
-            self.merge_audio_to_mp4(saved_path)
+        if self.recording_audio_track and ext == '.mp4':
+            self.merge_audio_to_mp4(saved_path, self.recording_audio_track, self.recording_audio_offset)
         
         self.is_recording = False
         self.recording_writer = None
@@ -1710,7 +1963,10 @@ class AnimatorApp(QMainWindow):
                 QMessageBox.critical(self, "Export Error", f"An error occurred during export:\n{e}")
     
     def closeEvent(self, event):
-        """Ensures recording is stopped and audio is stopped when closing the app."""
+        """Offers to save, then stops recording and audio when closing the app."""
+        if not self.maybe_save_changes():
+            event.ignore()
+            return
         if self.is_recording:
             self.stop_recording()
         self.stop_audio()
@@ -1720,4 +1976,7 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = AnimatorApp()
     window.show()
+    # Open a project passed on the command line: python spiral_animator.py my.spiral
+    if len(sys.argv) > 1 and sys.argv[1].lower().endswith(PROJECT_EXTENSION):
+        window.load_project_file(sys.argv[1])
     sys.exit(app.exec())
